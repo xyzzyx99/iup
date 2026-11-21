@@ -101,7 +101,31 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'MSVC linker was not configured.' }
           & where.exe make.exe
           if ($LASTEXITCODE -ne 0) { throw 'GNU Make was not installed.' }
-          & make.exe -C (Join-Path $env:IUP_SRC 'src') -j 2
+
+          # Tecmake's Windows defaults point to x:/lng/vc16 (a Tecgraf-local
+          # directory, not a GitHub runner path).  Overriding PATH alone does
+          # not help because the Makefile constructs absolute tool paths.
+          # GNU Make command-line assignments take precedence over the defaults
+          # and are passed to the recursive make processes building IUP.
+          # The MSVC developer environment already supplies INCLUDE and LIB,
+          # so drop Tecmake's non-existent hard-coded SDK search directories.
+          $makeOverrides = @(
+            'CC=cl.exe -nologo',
+            'CPPC=cl.exe -nologo',
+            'LINKER=link.exe -nologo',
+            'LIBC=lib.exe -nologo',
+            'RCC=rc.exe -fo',
+            'MT=mt.exe -nologo',
+            'STDINCS=',
+            'STDLIBDIR='
+          )
+          Write-Host 'Using MSVC tools from PATH and SDK include/lib paths from the VS developer environment.'
+          Write-Host 'Tecmake overrides:'
+          $makeOverrides | ForEach-Object { Write-Host "  $_" }
+          if (-not $env:INCLUDE -or -not $env:LIB) {
+            throw 'MSVC developer environment is missing INCLUDE or LIB.'
+          }
+          & make.exe -C (Join-Path $env:IUP_SRC 'src') @makeOverrides -j 2
           if ($LASTEXITCODE -ne 0) { throw 'IUP core MSVC build failed.' }
 
       - name: Verify binaries and prepare release ZIP
