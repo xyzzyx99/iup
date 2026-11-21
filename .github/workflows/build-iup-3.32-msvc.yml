@@ -108,8 +108,8 @@ jobs:
           # not help because the Makefile constructs absolute tool paths.
           # GNU Make command-line assignments take precedence over the defaults
           # and are passed to the recursive make processes building IUP.
-          # The MSVC developer environment already supplies INCLUDE and LIB,
-          # so drop Tecmake's non-existent hard-coded SDK search directories.
+          # The MSVC developer environment supplies INCLUDE. Library paths
+          # are added explicitly below because Tecmake defaults are obsolete.
           $makeOverrides = @(
             'CC=cl.exe -nologo',
             'CPPC=cl.exe -nologo',
@@ -120,12 +120,64 @@ jobs:
             'STDINCS=',
             'STDLIBDIR='
           )
-          Write-Host 'Using MSVC tools from PATH and SDK include/lib paths from the VS developer environment.'
+          Write-Host 'Using MSVC tools from PATH; SDK library paths are configured explicitly below.'
           Write-Host 'Tecmake overrides:'
           $makeOverrides | ForEach-Object { Write-Host "  $_" }
-          if (-not $env:INCLUDE -or -not $env:LIB) {
-            throw 'MSVC developer environment is missing INCLUDE or LIB.'
+          if (-not $env:INCLUDE) {
+            throw 'MSVC developer environment is missing INCLUDE.'
           }
+
+          # Tecmake has its own library-path variables, and the recursive
+          # GNU Make invocation may not preserve the SDK search paths that
+          # link.exe requires. Discover the *installed* x64 SDK libraries,
+          # validate them, and pass explicit /LIBPATH flags via _LINK_.
+          $kitsLib = Join-Path ([Environment]::GetFolderPath('ProgramFilesX86')) 'Windows Kits\10\Lib'
+          if (-not (Test-Path -LiteralPath $kitsLib -PathType Container)) {
+            throw "Windows 10/11 SDK libraries not found: $kitsLib"
+          }
+          $sdkVersions = @()
+          foreach ($value in @($env:WindowsSDKLibVersion, $env:WindowsSDKVersion)) {
+            if ($value) { $sdkVersions += $value.TrimEnd('\').TrimEnd('/') }
+          }
+          $sdkVersions += @(Get-ChildItem -LiteralPath $kitsLib -Directory |
+            Sort-Object Name -Descending | Select-Object -ExpandProperty Name)
+          $sdkUm = $null
+          $sdkUcrt = $null
+          foreach ($version in ($sdkVersions | Select-Object -Unique)) {
+            $um = Join-Path $kitsLib "$version\um\x64"
+            $ucrt = Join-Path $kitsLib "$version\ucrt\x64"
+            if ((Test-Path -LiteralPath (Join-Path $um 'kernel32.lib') -PathType Leaf) -and
+                (Test-Path -LiteralPath (Join-Path $ucrt 'ucrt.lib') -PathType Leaf)) {
+              $sdkUm = $um
+              $sdkUcrt = $ucrt
+              break
+            }
+          }
+          if (-not $sdkUm) {
+            throw 'Could not find matching x64 Windows SDK um and ucrt libraries.'
+          }
+          if (-not $env:VCToolsInstallDir) {
+            throw 'MSVC developer environment is missing VCToolsInstallDir.'
+          }
+          $vcLib = Join-Path $env:VCToolsInstallDir 'lib\x64'
+          if (-not (Test-Path -LiteralPath (Join-Path $vcLib 'vcruntime.lib') -PathType Leaf)) {
+            throw "MSVC x64 runtime library not found: $vcLib"
+          }
+
+          # Explicit linker search paths avoid relying on Tecmake's historical
+          # x:/lng SDK paths and on propagation of the LIB variable by make.
+          $libDirs = @($vcLib, $sdkUm, $sdkUcrt) + @($env:LIB -split ';')
+          $libDirs = @($libDirs | Where-Object {
+            $_ -and (Test-Path -LiteralPath $_ -PathType Container)
+          } | Select-Object -Unique)
+          $env:LIB = $libDirs -join ';'
+          $libFlags = ($libDirs | ForEach-Object { '/LIBPATH:"' + $_ + '"' }) -join ' '
+          $env:_LINK_ = "$env:_LINK_ $libFlags".Trim()
+          Write-Host "Windows SDK UM libraries: $sdkUm"
+          Write-Host "Windows SDK UCRT libraries: $sdkUcrt"
+          Write-Host "MSVC x64 libraries: $vcLib"
+          Write-Host 'Explicit /LIBPATH options appended to _LINK_.'
+
           & make.exe -C (Join-Path $env:IUP_SRC 'src') @makeOverrides -j 2
           if ($LASTEXITCODE -ne 0) { throw 'IUP core MSVC build failed.' }
 
