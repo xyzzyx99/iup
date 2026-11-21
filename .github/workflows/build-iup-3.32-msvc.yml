@@ -1,0 +1,168 @@
+name: Build IUP 3.32 (MSVC optimized)
+
+on:
+  workflow_dispatch:
+    inputs:
+      avx2:
+        description: 'Enable /arch:AVX2 (requires AVX2-capable CPUs)'
+        type: boolean
+        default: true
+  push:
+    paths:
+      - '.github/workflows/build-iup-3.32-msvc.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: IUP 3.32 core DLL - MSVC 2022 x64
+    runs-on: windows-2022
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      IUP_VERSION: '3.32'
+      IUP_SHA256: 'f0445c4200bdf0531cd47d6c84196464f378e3152e27fabd472e7e8936ac32e3'
+      ENABLE_AVX2: ${{ github.event_name == 'workflow_dispatch' && inputs.avx2 && 'true' || 'false' }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Configure MSVC 2022 x64
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          vsversion: '2022'
+          arch: amd64
+
+      - name: Install GNU Make
+        run: |
+          choco install make --yes --no-progress
+          if ($LASTEXITCODE -ne 0) { throw 'Installing GNU Make failed.' }
+          Get-Command make.exe -ErrorAction Stop | Format-List Source
+
+      - name: Download and verify official IUP 3.32 source
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $sourceRoot = Join-Path $env:RUNNER_TEMP 'iup-upstream'
+          New-Item -ItemType Directory -Path $sourceRoot -Force | Out-Null
+          $archive = Join-Path $env:RUNNER_TEMP 'iup-3.32_Sources.zip'
+          $urls = @(
+            'https://downloads.sourceforge.net/project/iup/3.32/Docs%20and%20Sources/iup-3.32_Sources.zip',
+            'https://sourceforge.net/projects/iup/files/3.32/Docs%20and%20Sources/iup-3.32_Sources.zip/download'
+          )
+          $verified = $false
+          foreach ($url in $urls) {
+            Write-Host "Downloading IUP 3.32 from $url"
+            & curl.exe --fail --location --silent --show-error --retry 4 --retry-all-errors --retry-delay 3 --connect-timeout 30 --max-time 240 --output $archive $url
+            if ($LASTEXITCODE -ne 0 -or -not (Test-Path $archive)) { continue }
+            $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant()
+            if ($actual -eq $env:IUP_SHA256) {
+              $verified = $true
+              break
+            }
+            Write-Warning "Downloaded file SHA-256 mismatch: $actual"
+          }
+          if (-not $verified) { throw 'Could not download and verify the official IUP 3.32 source archive.' }
+
+          Expand-Archive -LiteralPath $archive -DestinationPath $sourceRoot -Force
+          $iup = Join-Path $sourceRoot 'iup'
+          if (-not (Test-Path (Join-Path $iup 'src/Makefile'))) {
+            $matches = @(Get-ChildItem -Path $sourceRoot -Recurse -Filter config.mak -File |
+              Where-Object { $_.Directory.Name -eq 'src' -and (Test-Path (Join-Path $_.Directory.FullName 'Makefile')) })
+            if ($matches.Count -ne 1) { throw "Could not locate the IUP core src/Makefile (found $($matches.Count) candidates)." }
+            $iup = Split-Path -Parent $matches[0].Directory.FullName
+          }
+          if (-not (Test-Path (Join-Path $iup 'include/iup.h'))) {
+            throw 'Missing include/iup.h in downloaded source.'
+          }
+          "IUP_SRC=$iup" >> $env:GITHUB_ENV
+          Write-Host "Verified official IUP source; root: $iup"
+
+      - name: Build optimized 64-bit iup.dll using MSVC
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:PATH += ";C:\Program Files\Git\usr\bin"  # Keep MSVC link.exe ahead of GNU link.exe
+          $env:TEC_UNAME = 'dll17_64'    # Visual Studio 2022, DLL, x64
+          $env:OPT = 'Yes'
+          $env:NO_DEPEND = 'Yes'        # Skip Tecmake's optional gcc dependency scanner
+          # _CL_ and _LINK_ are processed AFTER command-line options by MSVC.
+          # This guarantees the requested optimizations even if Tecmake sets its own defaults.
+          $env:_CL_ = '/O2 /Oi /GL /Gy /GF /DNDEBUG'
+          if ($env:ENABLE_AVX2 -eq 'true') { $env:_CL_ += ' /arch:AVX2' }
+          $env:_LINK_ = '/LTCG /OPT:REF /OPT:ICF /INCREMENTAL:NO'
+          Write-Host "MSVC flags: $env:_CL_"
+          Write-Host "LINK flags: $env:_LINK_"
+          & where.exe cl.exe
+          if ($LASTEXITCODE -ne 0) { throw 'MSVC compiler was not configured.' }
+          & where.exe link.exe
+          if ($LASTEXITCODE -ne 0) { throw 'MSVC linker was not configured.' }
+          & where.exe make.exe
+          if ($LASTEXITCODE -ne 0) { throw 'GNU Make was not installed.' }
+          & make.exe -C (Join-Path $env:IUP_SRC 'src') -j 2
+          if ($LASTEXITCODE -ne 0) { throw 'IUP core MSVC build failed.' }
+
+      - name: Verify binaries and prepare release ZIP
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dlls = @(Get-ChildItem -Path $env:IUP_SRC -Recurse -File -Filter 'iup.dll')
+          $libs = @(Get-ChildItem -Path $env:IUP_SRC -Recurse -File -Filter 'iup.lib')
+          if ($dlls.Count -ne 1 -or $libs.Count -ne 1) {
+            $dlls | ForEach-Object { Write-Host "DLL: $($_.FullName)" }
+            $libs | ForEach-Object { Write-Host "LIB: $($_.FullName)" }
+            throw "Expected one iup.dll and one iup.lib; found $($dlls.Count) DLLs and $($libs.Count) libraries."
+          }
+          $dll = $dlls[0]
+          $lib = $libs[0]
+          $headers = (& dumpbin.exe /headers $dll.FullName | Out-String)
+          if ($LASTEXITCODE -ne 0 -or $headers -notmatch '(?i)8664\s+machine\s+\(x64\)') {
+            throw 'Built iup.dll is not a valid x64 PE DLL.'
+          }
+          $exports = (& dumpbin.exe /exports $dll.FullName | Out-String)
+          if ($LASTEXITCODE -ne 0 -or $exports -notmatch '\bIupOpen\b' -or $exports -notmatch '\bIupVersion\b') {
+            throw 'Built iup.dll does not export the expected IUP functions.'
+          }
+
+          $stage = Join-Path $env:RUNNER_TEMP 'iup-release'
+          New-Item -ItemType Directory -Path "$stage/bin", "$stage/lib", "$stage/include" -Force | Out-Null
+          Copy-Item -LiteralPath $dll.FullName -Destination "$stage/bin/iup.dll"
+          Copy-Item -LiteralPath $lib.FullName -Destination "$stage/lib/iup.lib"
+          Copy-Item -Path (Join-Path $env:IUP_SRC 'include/*') -Destination "$stage/include" -Recurse -Force
+          @'
+          #include "iup.h"
+          int main(void) { return IupVersion() == 0; }
+          '@ | Set-Content -Path (Join-Path $env:RUNNER_TEMP 'iup-smoke.c') -Encoding ascii
+          & cl.exe /nologo /MD /O2 "/I$stage/include" (Join-Path $env:RUNNER_TEMP 'iup-smoke.c') /link "/LIBPATH:$stage/lib" iup.lib "/OUT:$env:RUNNER_TEMP/iup-smoke.exe"
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path "$env:RUNNER_TEMP/iup-smoke.exe")) {
+            throw 'IUP header/import library link smoke test failed.'
+          }
+
+          $flavor = if ($env:ENABLE_AVX2 -eq 'true') { 'avx2' } else { 'generic-x64' }
+          $avx2Flag = if ($env:ENABLE_AVX2 -eq 'true') { ' /arch:AVX2' } else { '' }
+          @(
+            'IUP 3.32 — built from verified upstream sources',
+            'Compiler: Microsoft Visual C++ (VS2022, x64)',
+            "Optimization: /O2 /Oi /GL /Gy /GF$avx2Flag",
+            'Linker: /LTCG /OPT:REF /OPT:ICF /INCREMENTAL:NO',
+            'Contents: core IUP DLL, matching MSVC import library, public headers.',
+            'Other IUP components (Lua, CD, IM, etc.) are not included.',
+            'Runtime: Microsoft Visual C++ 2015-2022 Redistributable (x64) may be required.',
+            'Use: place bin/iup.dll alongside your program; link with lib/iup.lib.',
+            "Upstream source SHA-256: $env:IUP_SHA256"
+          ) | Set-Content -Path "$stage/BUILD-INFO.txt" -Encoding utf8
+          $dist = Join-Path $env:GITHUB_WORKSPACE 'dist'
+          New-Item -ItemType Directory -Path $dist -Force | Out-Null
+          $zip = Join-Path $dist "iup-3.32-msvc-x64-$flavor.zip"
+          Compress-Archive -Path "$stage/*" -DestinationPath $zip -Force
+          Write-Host "Created: $zip"
+          Get-Item $zip | Select-Object FullName, Length
+
+      - name: Upload optimized IUP 3.32 build
+        uses: actions/upload-artifact@v4
+        with:
+          name: iup-3.32-msvc-x64
+          path: dist/iup-3.32-msvc-x64-*.zip
+          if-no-files-found: error
+          retention-days: 30
