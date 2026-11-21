@@ -18,7 +18,7 @@ jobs:
   build:
     name: IUP 3.32 core DLL - MSVC 2022 x64
     runs-on: windows-2022
-    timeout-minutes: 45
+    timeout-minutes: 90
     defaults:
       run:
         shell: pwsh
@@ -44,6 +44,7 @@ jobs:
           Get-Command make.exe -ErrorAction Stop | Format-List Source
 
       - name: Download and verify official IUP 3.32 source
+        timeout-minutes: 45
         run: |
           $ErrorActionPreference = 'Stop'
           $sourceRoot = Join-Path $env:RUNNER_TEMP 'iup-upstream'
@@ -56,7 +57,7 @@ jobs:
           $verified = $false
           foreach ($url in $urls) {
             Write-Host "Downloading IUP 3.32 from $url"
-            & curl.exe --fail --location --silent --show-error --retry 4 --retry-all-errors --retry-delay 3 --connect-timeout 30 --max-time 240 --output $archive $url
+            & curl.exe --fail --location --silent --show-error --connect-timeout 120 --max-time 1800 --retry 5 --retry-delay 15 --retry-all-errors --output $archive $url
             if ($LASTEXITCODE -ne 0 -or -not (Test-Path $archive)) { continue }
             $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant()
             if ($actual -eq $env:IUP_SHA256) {
